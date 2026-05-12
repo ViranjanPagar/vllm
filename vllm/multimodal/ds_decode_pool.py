@@ -8,11 +8,15 @@ NVMM frames into a CUDA tensor allocated from PyTorch's caching
 allocator and the caller uses that tensor directly — no D2H/H2D
 round-trip, no IPC handle, no per-decode tensor reconstruction.
 
-:class:`DecodePool` is the file-decode pool. Workers pre-build a
-``filesrc → parsebin → nvv4l2decoder → nvvideoconvert →
-capsfilter[NVMM RGB] → fakesink`` pipeline and swap source URIs
-between requests. ``parsebin`` auto-routes H.264, H.265, and the
-containers wrapping them (MP4, MKV, MPEG-TS).
+Two pool shapes are exposed:
+
+* :class:`DecodePool` — file-decode pool. Workers pre-build a
+  ``filesrc → parsebin → nvv4l2decoder → nvvideoconvert →
+  capsfilter[NVMM RGB] → fakesink`` pipeline and swap source URIs
+  between requests. ``parsebin`` auto-routes H.264, H.265, and the
+  containers wrapping them (MP4, MKV, MPEG-TS).
+* :class:`StreamHandle` — one persistent pipeline per RTSP/URI stream
+  (``uridecodebin → nvvideoconvert → capsfilter → fakesink``).
 """
 
 from __future__ import annotations
@@ -705,6 +709,106 @@ class _FileWorkerState(_BaseWorkerState):
 # ----------------------------------------------------------------------
 # RTSP / persistent-stream worker — pipeline stays in PLAYING forever
 # ----------------------------------------------------------------------
+class _StreamWorkerState(_BaseWorkerState):
+    def __init__(self, uri: str, drop_interval: int):
+        super().__init__(worker_id=0, drop_interval=drop_interval)
+        self.uri = uri
+        # Live streams cannot accept EOS — use a threading.Event in the
+        # worker process to wake the request handler when the count probe
+        # has captured ``max_frames``.
+        import threading
+        self._done_event = threading.Event()
+
+    def start(self) -> None:
+        Gst = self._ensure_gst()
+        self._ensure_cudart()
+
+        elems = {
+            "uridec":  Gst.ElementFactory.make("uridecodebin",   None),
+            "nvvconv": Gst.ElementFactory.make("nvvideoconvert", None),
+            "capsf":   Gst.ElementFactory.make("capsfilter",     None),
+            "sink":    Gst.ElementFactory.make("fakesink",       None),
+        }
+        missing = [k for k, v in elems.items() if v is None]
+        if missing:
+            raise RuntimeError(f"stream element creation failed: {missing}")
+
+        elems["uridec"].set_property("uri", self.uri)
+        elems["nvvconv"].set_property("nvbuf-memory-type", 2)
+        elems["sink"].set_property("sync", False)
+        caps = Gst.Caps.from_string(
+            "video/x-raw(memory:NVMM), format=RGB")
+        elems["capsf"].set_property("caps", caps)
+
+        pipeline = Gst.Pipeline.new(None)
+        for e in elems.values():
+            pipeline.add(e)
+        if not (elems["nvvconv"].link(elems["capsf"])
+                and elems["capsf"].link(elems["sink"])):
+            raise RuntimeError("stream downstream link failed")
+
+        def _on_uridec_pad(_dec, pad):
+            cap = pad.query_caps(None)
+            if not cap or cap.get_size() == 0:
+                return
+            name = cap.get_structure(0).get_name()
+            if not name.startswith("video/"):
+                return
+            sink_pad = elems["nvvconv"].get_static_pad("sink")
+            if sink_pad and not sink_pad.is_linked():
+                pad.link(sink_pad)
+        elems["uridec"].connect("pad-added", _on_uridec_pad)
+
+        BUF = Gst.PadProbeType.BUFFER
+        elems["nvvconv"].get_static_pad("sink").add_probe(
+            BUF, self._select_probe, None)
+        elems["capsf"].get_static_pad("src").add_probe(
+            BUF, self._copy_probe, None)
+
+        self.pipeline = pipeline
+        self.elements = elems
+
+        pipeline.set_state(Gst.State.PLAYING)
+
+    def decode_segment(self, req: _DecodeRequest) -> _DecodeResult:
+        if self.pipeline is None:
+            return _DecodeResult(
+                job_id=req.job_id, worker_id=self.worker_id,
+                error="stream pipeline not running")
+
+        self._reset_for_decode(req)
+
+        # Block until the copy probe signals (via threading.Event) or we
+        # time out. Pipeline keeps running; an upstream error is caught
+        # by polling the bus non-blocking after the wait.
+        signaled = self._done_event.wait(req.timeout_sec)
+
+        Gst = self._Gst
+        bus = self.pipeline.get_bus()
+        error = ""
+        if not signaled:
+            error = f"timeout after {req.timeout_sec}s"
+        msg = bus.pop_filtered(Gst.MessageType.ERROR)
+        if msg is not None:
+            err, dbg = msg.parse_error()
+            error = f"{err.message} ({dbg})"
+
+        return self._finalize_result(req, error)
+
+    def shutdown(self) -> None:
+        if self.pipeline is None:
+            return
+        self.pipeline.set_state(self._Gst.State.NULL)
+        self.pipeline = None
+        self.elements = {}
+
+
+# ----------------------------------------------------------------------
+# GstBuffer → NvBufSurface accessor
+# ----------------------------------------------------------------------
+_NVBUF_SURFACE_HEAD_SZ = ctypes.sizeof(_NvBufSurface)
+
+
 def _read_nvbuf_surface_first(buf, Gst):
     """Read pitch + dataPtr + width + height from ``surfaceList[0]``.
 
@@ -776,6 +880,30 @@ def _file_worker_loop(worker_id: int,
             if req is None:
                 break
             res = state.decode(req)
+            res_q.put(res)
+    finally:
+        state.shutdown()
+
+
+def _stream_worker_loop(uri: str,
+                        drop_interval: int,
+                        req_q,
+                        res_q,
+                        closed_flag: "list[bool]") -> None:
+    state = _StreamWorkerState(uri, drop_interval)
+    try:
+        state.start()
+    except Exception as e:
+        res_q.put(_DecodeResult(
+            job_id=-1, worker_id=0,
+            error=f"stream start failed: {e}"))
+        return
+    try:
+        while not closed_flag[0]:
+            req: _DecodeRequest | None = req_q.get()
+            if req is None:
+                break
+            res = state.decode_segment(req)
             res_q.put(res)
     finally:
         state.shutdown()
@@ -880,6 +1008,61 @@ class DecodePool:
             t.join(timeout=5)
         with self._cv:
             self._cv.notify_all()
+
+
+class StreamHandle:
+    """One persistent RTSP/URI pipeline on a daemon thread. Shares the
+    process-wide CUDA context with any active :class:`DecodePool`."""
+
+    def __init__(self, uri: str, drop_interval: int = 0) -> None:
+        import queue as _queue
+        import threading
+
+        if torch.cuda.is_available():
+            torch.cuda.init()
+
+        self._req_q: "_queue.Queue" = _queue.Queue()
+        self._res_q: "_queue.Queue" = _queue.Queue()
+        self._closed_flag = [False]
+        self._uri = uri
+        self._next_id = 0
+        self._closed = False
+        self._worker = threading.Thread(
+            target=_stream_worker_loop,
+            args=(uri, drop_interval,
+                  self._req_q, self._res_q, self._closed_flag),
+            daemon=True,
+            name=f"ds-stream-thread-{uri[:32]}",
+        )
+        self._worker.start()
+
+    def decode_segment(self,
+                       *,
+                       target_indices: list[int] | None = None,
+                       max_frames: int = 8,
+                       timeout_sec: float = 30.0) -> DecodeFrames:
+        if self._closed:
+            raise RuntimeError("StreamHandle is closed")
+        job_id = self._next_id
+        self._next_id += 1
+        self._req_q.put(_DecodeRequest(
+            job_id=job_id,
+            uri=self._uri,
+            target_indices=tuple(target_indices) if target_indices else (),
+            use_pts_mode=False,
+            max_frames=max_frames,
+            timeout_sec=timeout_sec,
+        ))
+        res: _DecodeResult = self._res_q.get()
+        return _to_decode_frames(res)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._closed_flag[0] = True
+        self._req_q.put(None)
+        self._worker.join(timeout=5)
 
 
 def _to_decode_frames(res: _DecodeResult) -> DecodeFrames:

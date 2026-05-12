@@ -82,6 +82,34 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_RTSP_SCHEMES = ("rtsp://", "rtsps://", "rtmp://")
+
+
+def _find_rtsp_video_url(messages) -> str | None:
+    """If any user message contains a ``video_url`` content part with an
+    rtsp/rtsps/rtmp scheme, return that URL; otherwise return None."""
+    for msg in messages:
+        content = (
+            msg.get("content") if isinstance(msg, dict)
+            else getattr(msg, "content", None)
+        )
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            url = None
+            if isinstance(part, dict):
+                if part.get("type") == "video_url":
+                    vu = part.get("video_url") or {}
+                    url = vu.get("url") if isinstance(vu, dict) else None
+            else:
+                if getattr(part, "type", None) == "video_url":
+                    vu = getattr(part, "video_url", None)
+                    url = getattr(vu, "url", None) if vu is not None else None
+            if isinstance(url, str) and url.startswith(_RTSP_SCHEMES):
+                return url
+    return None
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -237,6 +265,25 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        # RTSP live-stream dispatch: when the request is streaming and any
+        # user message carries an rtsp:// (or rtsps/rtmp) video_url, delegate
+        # to the streaming serving — it owns the DeepStream RTSP pipeline
+        # and emits one chat.completion.chunk per decoded segment caption.
+        if request.stream and raw_request is not None:
+            rtsp_url = _find_rtsp_video_url(request.messages)
+            if rtsp_url is not None:
+                streaming_serving = getattr(
+                    raw_request.app.state, "video_streaming_serving", None
+                )
+                if streaming_serving is None:
+                    return self.create_error_response(
+                        "Live RTSP streaming is not enabled; check that the "
+                        "DeepStream video backend is available."
+                    )
+                return await streaming_serving.create_video_chat_stream(
+                    request, raw_request, rtsp_url=rtsp_url,
+                )
+
         return await self._with_kv_transfer_rejection_cleanup(
             self._create_chat_completion(request, raw_request), request, raw_request
         )

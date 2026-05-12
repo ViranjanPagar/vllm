@@ -220,6 +220,12 @@ def build_app(
 
         elastic_ep_attach_router(app)
 
+        from vllm.entrypoints.openai.streaming.api_router import (
+            attach_router as register_streaming_router,
+        )
+
+        register_streaming_router(app)
+
         from vllm.entrypoints.openai.generative_scoring.api_router import (
             register_generative_scoring_api_router,
         )
@@ -413,6 +419,17 @@ async def init_app_state(
         )
 
         await init_generative_scoring_state(engine_client, state, args, request_logger)
+
+        from vllm.entrypoints.openai.streaming.api_router import (
+            init_streaming_state,
+        )
+
+        init_streaming_state(
+            engine_client, state, args, request_logger, supported_tasks
+        )
+
+        if state.video_streaming_serving is not None:
+            await state.video_streaming_serving.prewarm()
 
     if "transcription" in supported_tasks or "realtime" in supported_tasks:
         from vllm.entrypoints.speech_to_text.factories import init_speech_to_text_state

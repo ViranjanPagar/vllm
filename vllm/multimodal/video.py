@@ -926,6 +926,84 @@ class DeepStreamVideoBackend(VideoLoader):
                     }
                     # GPU → CPU NHWC uint8 at the DS boundary (see load_bytes).
                     yield res.frames.cpu().numpy(), metadata
+
+    # ----------------------------------------------------------------
+    # RTSP / URI streaming (per-stream worker)
+    # ----------------------------------------------------------------
+    @classmethod
+    def stream_uri(
+        cls,
+        uri: str,
+        num_frames: int = 8,
+        chunk_duration: float = 0.0,
+        timeout_sec: float = 30.0,
+    ):
+        """Generator: stream an RTSP/URI source via a dedicated pipeline.
+
+        One :class:`StreamHandle` per call — pipelines never share between
+        streams, so contention scales independently of stream count.
+        Frames stay GPU-resident.
+        """
+        import torch as _torch
+
+        from vllm.multimodal.ds_decode_pool import StreamHandle
+
+        handle = StreamHandle(uri, drop_interval=0)
+        logger.info("[DeepStream] Opened RTSP stream uri=%s", uri)
+        try:
+            detected_fps = 0.0
+            while True:
+                if chunk_duration > 0 and detected_fps > 0:
+                    raw_keep = max(num_frames,
+                                   round(chunk_duration * detected_fps))
+                else:
+                    raw_keep = num_frames
+
+                if raw_keep > num_frames:
+                    target_indices: list[int] | None = (
+                        np.linspace(0, raw_keep - 1, num_frames,
+                                    dtype=int).tolist())
+                else:
+                    target_indices = None
+
+                res = handle.decode_segment(
+                    target_indices=target_indices,
+                    max_frames=num_frames,
+                    timeout_sec=timeout_sec,
+                )
+
+                if res.error:
+                    logger.error(
+                        "[DeepStream RTSP] decode error: %s", res.error)
+                    break
+
+                if res.fps > 0:
+                    detected_fps = res.fps
+
+                if (res.frames is None
+                        or not isinstance(res.frames, _torch.Tensor)
+                        or res.frames.shape[0] == 0):
+                    break
+
+                logger.info(
+                    "[RTSP stream_uri] segment: raw_keep=%d "
+                    "yielding=%d fps=%.2f buffer_sec=%.1f",
+                    raw_keep, res.frames.shape[0],
+                    detected_fps, chunk_duration,
+                )
+
+                metadata: dict = {
+                    "total_num_frames": res.n_total,
+                    "fps": res.fps,
+                    "video_backend": "deepstream_rtsp",
+                }
+                # GPU → CPU NHWC uint8 at the DS boundary (see load_bytes).
+                yield res.frames.cpu().numpy(), metadata
+        finally:
+            handle.close()
+            logger.info("[DeepStream] Closed RTSP stream uri=%s", uri)
+
+
 @VIDEO_LOADER_REGISTRY.register("molmo2")
 class Molmo2VideoBackend(VideoLoader, OpenCVVideoBackendMixin):
     @classmethod
