@@ -655,7 +655,7 @@ class DeepStreamVideoBackend(VideoLoader):
     allocated from PyTorch's caching allocator and handed to the caller
     directly — no D2H/H2D round-trip.
 
-    See ``vllm/multimodal/ds_decode_pool.py`` for the pool implementation.
+    See the ``deepstream_decode`` PyPI package for the pool implementation.
     """
 
     @staticmethod
@@ -697,7 +697,7 @@ class DeepStreamVideoBackend(VideoLoader):
                 return cls._pool
             import os as _os
 
-            from vllm.multimodal.ds_decode_pool import DecodePool
+            from deepstream_decode import DecodePool
 
             pool_size = int(
                 _os.environ.get(
@@ -946,7 +946,7 @@ class DeepStreamVideoBackend(VideoLoader):
         """
         import torch as _torch
 
-        from vllm.multimodal.ds_decode_pool import StreamHandle
+        from deepstream_decode import StreamHandle
 
         handle = StreamHandle(uri, drop_interval=0)
         logger.info("[DeepStream] Opened RTSP stream uri=%s", uri)
