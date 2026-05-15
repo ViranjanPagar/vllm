@@ -23,6 +23,7 @@ Examples:
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -137,7 +138,16 @@ def main():
         default="rtsp://10.24.217.130:8554/",
         help="RTSP or file:// URI (default: rtsp://10.24.217.130:8554/)",
     )
-    parser.add_argument("--server",   default="http://localhost:8000")
+    # Default server URL honors $PORT (and $HOST) env vars so the script
+    # works with `PORT=8001 python3 test_rtsp_stream.py ...` without
+    # needing --server. Explicit --server still overrides.
+    default_server = (
+        f"http://{os.environ.get('HOST', 'localhost')}"
+        f":{os.environ.get('PORT', '8000')}"
+    )
+    parser.add_argument("--server", default=default_server,
+                        help=f"Server base URL (default: {default_server}, "
+                             f"override via $HOST/$PORT or --server)")
     parser.add_argument("--model",    default="bench-model")
     parser.add_argument("--prompt",   default="Describe what is happening in this video segment.")
     parser.add_argument("--chunk-duration", type=float, default=10.0, help="Seconds per chunk/segment")
